@@ -8,21 +8,20 @@ This project implements gradient boosting for regression and binary classificati
 
 ### Key Features
 
-- ✅ **Algorithm 10.4** for squared-error loss (regression)
-- ✅ **Algorithm 10.4** for binomial deviance (classification)
-- ✅ Pseudo-residual computation (negative gradients)
-- ✅ Leaf optimisation using closed-form solutions (MSE) and Newton-Raphson (logistic loss)
-- ✅ Shrinkage (learning rate) for regularisation
-- ✅ Stochastic subsampling for variance reduction
-- ✅ Comprehensive unit tests
-- ✅ Reproducible experiments with visualisations
-- ✅ Interactive Jupyter notebook demo
+- **Algorithm 10.4** for squared-error loss (regression)
+- **Algorithm 10.4** for binomial deviance (classification)
+- Pseudo-residual computation (negative gradients)
+- Leaf optimisation using closed-form solutions (MSE) and Newton-Raphson (logistic loss)
+- Shrinkage (learning rate) for regularisation
+- Stochastic subsampling for variance reduction
+- Comprehensive unit tests
+- Reproducible experiments with visualisations
+- Interactive Jupyter notebook demo
 
 ## Installation
 
 ```bash
 # Clone or navigate to the repository
-cd "d:\Projects2.0\Last Days Work\AML"
 
 # Install dependencies
 pip install -r requirements.txt
@@ -258,3 +257,4 @@ Implemented as part of coursework for Advanced Machine Learning.
 ---
 
 **Note:** This implementation prioritises correctness, clarity, and educational value over performance optimisation. For production use cases requiring high performance, consider libraries like XGBoost or LightGBM.
+
