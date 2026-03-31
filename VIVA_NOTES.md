@@ -1,1062 +1,1166 @@
 # Advanced Machine Learning — Viva Preparation Notes
 
 > **Scope**: Core algorithm implementations only (excludes testing code).  
-> **Format**: Theory → Code reference → How it is implemented.
+> **Format**: Each assignment is explained **in the order it executes** — from raw data all the way to final output.  
+> Every concept is paired with the exact file and line where it lives in the code.
 
 ---
 
 ## Table of Contents
 
-- [Assignment 1 — Gradient Boosting Trees (GBT)](#assignment-1--gradient-boosting-trees-gbt)
-- [Assignment 2 — Gaussian Processes (GP)](#assignment-2--gaussian-processes-gp)
-- [Assignment 3 — Variational Autoencoders (VAE & CVAE)](#assignment-3--variational-autoencoders-vae--cvae)
+- [Assignment 1 — Gradient Boosting Trees](#assignment-1--gradient-boosting-trees)
+- [Assignment 2 — Gaussian Processes](#assignment-2--gaussian-processes)
+- [Assignment 3 — Variational Autoencoders](#assignment-3--variational-autoencoders)
 
 ---
 
-# Assignment 1 — Gradient Boosting Trees (GBT)
+# Assignment 1 — Gradient Boosting Trees
+
+## What Is the Assignment Task?
+
+**Goal**: Implement **Gradient Tree Boosting from scratch** without using any off-the-shelf boosting library (no XGBoost, LightGBM, or sklearn.ensemble.GradientBoosting). The task covers two sub-problems:
+
+1. **Regression** on the *California Housing* dataset — predict median house value (MSE loss).
+2. **Binary Classification** on the *Breast Cancer Wisconsin* dataset — classify malignant/benign (logistic/binomial deviance loss).
+
+The implementation follows **Algorithm 10.4 (Gradient Tree Boosting)** from Hastie, Tibshirani & Friedman, *The Elements of Statistical Learning* (2009), Chapter 10.
 
 **Source files**: `Assignment1/src/gbt/core.py`, `Assignment1/src/gbt/utils.py`  
-**Reference**: Hastie, Tibshirani & Friedman, *The Elements of Statistical Learning* (2009), Ch. 10.
+**Experiment scripts**: `Assignment1/experiments/regression_run.py`, `classification_run.py`
 
 ---
 
-## 1.1 What Is Gradient Boosting?
-
-Gradient boosting builds an additive model **stage-by-stage**:
+## Pipeline Overview — Assignment 1
 
 ```
-F_M(x) = F_0(x) + ν·h_1(x) + ν·h_2(x) + … + ν·h_M(x)
+Raw Data
+  |
+  v
+Step 1 -- Load & Preprocess Data  (StandardScaler, train/val/test split)
+  |
+  v
+Step 2 -- Initialise Model  (compute F_0, the best constant baseline)
+  |
+  v
+Step 3 -- Boosting Loop  [repeat M times]
+  |          +-- 3a. Row subsampling  (stochastic boosting, optional)
+  |          +-- 3b. Compute pseudo-residuals  (negative gradient of loss)
+  |          +-- 3c. Fit a shallow regression tree to pseudo-residuals
+  |          +-- 3d. Re-optimise leaf values  (optimal gamma per leaf)
+  |          +-- 3e. Update running prediction:  F_m = F_{m-1} + nu * gamma
+  |
+  v
+Step 4 -- Predict on new data  (replay the loop, accumulate all trees)
+  |
+  v
+Step 5 -- Evaluate  (MSE for regression / log-loss, accuracy, AUC for classification)
 ```
-
-Each new weak learner `h_m` is fitted not to the original targets, but to the **negative gradient** of the loss — the direction that most reduces the loss at the current ensemble prediction. This converts any differentiable loss into a boosting algorithm (Algorithm 10.4 from ESL).
 
 ---
 
-## 1.2 Initialisation
+## Step 1 — Load and Preprocess Data
 
-### Theory
-The model starts with the **best constant prediction** that minimises the training loss:
+The experiments load standard sklearn datasets, apply an 80/20 train-test split (with a further 80/20 train-val split), and standardise features using `StandardScaler`.
 
-- **Regression (MSE)**: `F_0(x) = argmin_γ Σ L(y_i, γ)` → `mean(y)`.
-- **Classification (Logistic)**: `F_0(x) = log(p̄ / (1 − p̄))`, where `p̄ = mean(y)` is the fraction of positive labels.
-
-### Code — Regression (`core.py`, lines 127–129)
+**Code** (`regression_run.py`, lines 26-50):
 ```python
-# Step 1: Initialise f_0(x) = argmin_γ Σ L(y_i, γ) = mean(y) for MSE
+data = fetch_california_housing()
+X, y = data.data, data.target
+
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+X_train, X_val,  y_train, y_val  = train_test_split(X_train, y_train, test_size=0.2, random_state=42)
+
+scaler  = StandardScaler()
+X_train = scaler.fit_transform(X_train)   # fit only on train set
+X_val   = scaler.transform(X_val)         # apply the same scale to val and test
+X_test  = scaler.transform(X_test)
+```
+
+The validation set is passed to `gbr.fit(X_val=..., y_val=...)` to track the generalization loss curve during training. The test set is held back entirely for final evaluation.
+
+---
+
+## Step 2 — Model Initialisation (F_0)
+
+Before any tree is added, the model starts with the **best constant prediction** — the value that minimises the loss over all training samples:
+
+```
+F_0(x) = argmin_{gamma}  sum_i  L(y_i, gamma)
+```
+
+| Mode | Loss | F_0 | Why |
+|---|---|---|---|
+| Regression | MSE = 0.5*(y-F)^2 | mean(y) | Mean minimises squared error |
+| Classification | Logistic | log(p/(1-p)) | Log-odds of the base rate |
+
+**Code — Regression** (`core.py`, lines 127-129):
+```python
+# Initialise f_0(x) = mean(y) for MSE
 self.f0_ = np.mean(y)
-F_train = np.full(n_samples, self.f0_)   # Current predictions for every sample
+F_train  = np.full(n_samples, self.f0_)   # every sample gets the same starting prediction
 ```
-`F_train` is the running sum that gets updated at every boosting iteration.
 
-### Code — Classification (`core.py`, lines 273–279)
+**Code — Classification** (`core.py`, lines 273-279):
 ```python
-# Step 1: Initialise f_0(x) = log(p/(1-p)), where p = mean(y)
-p_init = np.mean(y)
-p_init = np.clip(p_init, 1e-15, 1 - 1e-15)  # avoid log(0)
-self.f0_ = np.log(p_init / (1 - p_init))      # log-odds initialisation
-
-F_train = np.full(n_samples, self.f0_)         # raw log-odds predictions
+p_init   = np.mean(y)                             # fraction of positive labels
+p_init   = np.clip(p_init, 1e-15, 1 - 1e-15)     # guard against log(0)
+self.f0_ = np.log(p_init / (1 - p_init))          # log-odds initialisation
+F_train  = np.full(n_samples, self.f0_)           # raw log-odds for all samples
 ```
-The clipping prevents numerical blowup when all labels are 0 or 1.
+
+`F_train` is a 1-D array of shape `(n_samples,)` holding the **running prediction**. It starts at `F_0` and is updated after every tree.
 
 ---
 
-## 1.3 Pseudo-Residuals (Negative Gradient)
+## Step 3a — Row Subsampling (Stochastic Boosting)
 
-### Theory
-At each boosting stage `m`, compute the **negative gradient of the loss** w.r.t. the current prediction:
+Before computing residuals, optionally draw a random fraction `subsample` of training rows **without replacement**. This acts as regularisation and speeds up training.
 
-```
-r_im = − ∂L(y_i, F_{m-1}(x_i)) / ∂F_{m-1}(x_i)
-```
-
-- **MSE loss** `L = 0.5(y − F)²`: `r_i = y_i − F_{m-1}(x_i)` (ordinary residuals).
-- **Logistic loss** `L = −y·log(p) − (1−y)·log(1−p)`: `r_i = y_i − σ(F_{m-1}(x_i))`.
-
-These are called *pseudo-residuals* because for MSE they literally are residuals, but for other losses they generalise that idea.
-
-### Code — MSE Negative Gradient (`utils.py`, lines 25–32)
+**Code** (`core.py`, lines 79-86, base class):
 ```python
-def mse_negative_gradient(y_true: np.ndarray, y_pred: np.ndarray) -> np.ndarray:
-    """
-    For L(y, f) = 0.5 * (y - f)^2:
-    -∂L/∂f = y - f  (ordinary residuals)
-    """
-    return y_true - y_pred
-```
-
-### Code — Logistic Negative Gradient (`utils.py`, lines 61–74)
-```python
-def logistic_negative_gradient(y_true: np.ndarray, y_pred_raw: np.ndarray) -> np.ndarray:
-    """
-    Gradient: ∂L/∂F = -y + p,  so negative gradient = y - p
-    where p = sigmoid(F)
-    """
-    p = sigmoid(y_pred_raw)
-    return y_true - p    # "residuals" in probability space
-```
-
-### Code — Boosting Loop Usage (`core.py`, lines 147–148 for regression; 297–298 for classification)
-```python
-# (a) Compute pseudo-residuals (negative gradient)
-residuals = mse_negative_gradient(y_sub, F_sub)   # or logistic_negative_gradient
-```
-
----
-
-## 1.4 Fitting the Weak Learner (Tree)
-
-### Theory
-A shallow decision tree is fitted to the pseudo-residuals `{(x_i, r_im)}`. The tree partitions the feature space into `J` disjoint leaf regions `R_{1m}, …, R_{Jm}`.
-
-**Key detail**: Even for classification, a **regression tree** (`DecisionTreeRegressor`) is used, because pseudo-residuals are continuous values.
-
-### Code (`core.py`, lines 151–156 for regression; 301–306 for classification)
-```python
-# (b) Fit tree to residuals
-tree = DecisionTreeRegressor(
-    max_depth=self.max_depth,          # controls J (number of leaves ≈ 2^max_depth)
-    min_samples_leaf=self.min_samples_leaf,
-    random_state=self.random_state
-)
-tree.fit(X_sub, residuals)
-```
-`DecisionTreeRegressor` is always used — even for classification — because it fits a continuous target (the pseudo-residuals).
-
----
-
-## 1.5 Leaf (Region) Optimisation — Optimal Gamma (γ)
-
-### Theory
-After the tree partitions the space, the split values assigned by the tree to each leaf are **not optimal** for our actual loss (the tree was fit on residuals, not the loss). We re-compute the best constant within each leaf:
-
-```
-γ_jm = argmin_γ  Σ_{x_i ∈ R_jm} L(y_i,  F_{m-1}(x_i) + γ)
-```
-
-- **MSE**: Closed-form → `γ* = mean(y_i − F_{m-1}(x_i))` in that leaf.
-- **Logistic**: No closed form → one-step **Newton-Raphson** approximation:
-  `γ* = Σ r_i / Σ p_i(1 − p_i)` (numerator = sum of pseudo-residuals, denominator = sum of second derivatives).
-
-### Code — MSE Optimal Gamma (`utils.py`, lines 35–43)
-```python
-def mse_optimal_gamma(y_true: np.ndarray, y_pred: np.ndarray) -> float:
-    """γ* = mean of residuals in the leaf."""
-    residuals = y_true - y_pred
-    return np.mean(residuals)
-```
-
-### Code — Logistic Optimal Gamma (`utils.py`, lines 77–109)
-```python
-def logistic_optimal_gamma(y_true, y_pred_raw, negative_gradients) -> float:
-    """Newton-Raphson step:  γ* = Σ r_i / Σ p_i(1-p_i)"""
-    p = sigmoid(y_pred_raw)
-    w = p * (1 - p)            # Second derivatives (Hessian diagonal)
-    w = np.clip(w, 1e-15, None)
-    numerator   = np.sum(negative_gradients)
-    denominator = np.sum(w)
-    if denominator == 0:
-        return 0.0
-    return numerator / denominator
-```
-
-### Code — Loop Over Leaves (`core.py`, lines 160–167 for regression)
-```python
-leaf_indices_sub = tree.apply(X_sub)    # which leaf does each training point fall in?
-unique_leaves    = np.unique(leaf_indices_sub)
-
-gamma_map = {}
-for leaf_id in unique_leaves:
-    mask = (leaf_indices_sub == leaf_id)
-    gamma_map[leaf_id] = mse_optimal_gamma(y_sub[mask], F_sub[mask])
-```
-`tree.apply(X)` returns the integer leaf ID for every sample — then we compute the optimal gamma for each leaf independently.
-
----
-
-## 1.6 Model Update with Shrinkage (Learning Rate)
-
-### Theory
-The model is updated by:
-
-```
-F_m(x) = F_{m-1}(x) + ν · Σ_j γ_jm · I(x ∈ R_jm)
-```
-
-where `ν ∈ (0,1]` is the **learning rate** (shrinkage). A smaller `ν` requires more trees but improves generalisation by regularising the additive expansion.
-
-### Code (`core.py`, lines 169–172 for regression)
-```python
-# (d) Update predictions with shrinkage
-leaf_indices_train = tree.apply(X)   # leaf assignment for ALL training samples
-update = np.array([gamma_map.get(leaf, 0.0) for leaf in leaf_indices_train])
-F_train += self.learning_rate * update   # ν · γ applied to every sample
-```
-`gamma_map.get(leaf, 0.0)` handles the edge case where a test-time leaf ID was not seen during training (defaults to zero update).
-
----
-
-## 1.7 Stochastic Boosting (Row Subsampling)
-
-### Theory
-At each iteration, only a random fraction `subsample` of training samples is used to compute residuals and fit the tree. This introduces variance reduction (like random forests) and speeds up training.
-
-### Code (`core.py`, lines 79–86 base class; lines 141–145 in regression loop)
-```python
-# Base class method
 def _subsample_indices(self, n_samples, rng):
     if self.subsample < 1.0:
         n_subsample = max(1, int(self.subsample * n_samples))
         indices = rng.choice(n_samples, size=n_subsample, replace=False)
         return np.sort(indices)
-    else:
-        return np.arange(n_samples)
-
-# In the boosting loop:
-indices = self._subsample_indices(n_samples, rng)
-X_sub   = X[indices]     # subset for residuals + tree fitting
-y_sub   = y[indices]
-F_sub   = F_train[indices]
+    return np.arange(n_samples)   # use all samples when subsample=1.0
 ```
-Note: After fitting on the subset, predictions are updated on the **full** `X` (line 170: `tree.apply(X)`), which is standard stochastic gradient boosting.
+
+**Used in loop** (`core.py`, lines 141-145 for regression):
+```python
+indices = self._subsample_indices(n_samples, rng)
+X_sub   = X[indices]        # features for this iteration
+y_sub   = y[indices]        # targets
+F_sub   = F_train[indices]  # current predictions for these rows
+```
 
 ---
 
-## 1.8 Prediction
+## Step 3b — Compute Pseudo-Residuals (Negative Gradient)
 
-### Theory
-Final prediction accumulates contributions from all trees:
+The key insight of gradient boosting: treat function fitting as **gradient descent in function space**. At each step, compute the direction (negative gradient of the loss) that most reduces the current loss:
 
 ```
-F_M(x) = F_0 + ν · Σ_{m=1}^{M}  γ_{j(x),m}
+r_{im} = - dL(y_i, F_{m-1}(x_i)) / dF_{m-1}(x_i)
 ```
 
-where `j(x)` is the leaf index for point `x` in tree `m`.
+For MSE this equals ordinary residuals `y - F`. For other losses it generalises that concept.
 
-### Code — `_predict_raw` (`core.py`, lines 199–222 for regression)
+**Code — MSE** (`utils.py`, lines 25-32):
+```python
+def mse_negative_gradient(y_true, y_pred):
+    """ -d/dF [0.5*(y-F)^2] = y - F """
+    return y_true - y_pred    # ordinary residuals
+```
+
+**Code — Logistic** (`utils.py`, lines 61-74):
+```python
+def logistic_negative_gradient(y_true, y_pred_raw):
+    """
+    Loss: L = -y*log(p) - (1-y)*log(1-p),  p = sigmoid(F)
+    Gradient: dL/dF = p - y
+    Negative gradient: y - p
+    """
+    p = sigmoid(y_pred_raw)   # convert raw log-odds to probability
+    return y_true - p         # residual in probability space
+```
+
+**Called in the loop** (`core.py`, lines 147-148):
+```python
+residuals = mse_negative_gradient(y_sub, F_sub)
+# or for classification:
+residuals = logistic_negative_gradient(y_sub, F_sub)
+```
+
+---
+
+## Step 3c — Fit a Shallow Decision Tree to Pseudo-Residuals
+
+A **regression tree** is fitted to the pairs `{(x_i, r_{im})}`. The tree partitions the feature space into `J` leaf regions.
+
+**Critical detail**: Even for the *classifier*, `DecisionTreeRegressor` is used — because pseudo-residuals are continuous floating-point values, not class labels.
+
+**Code** (`core.py`, lines 151-156 for regression; lines 301-306 for classification — identical):
+```python
+tree = DecisionTreeRegressor(
+    max_depth        = self.max_depth,        # controls J ~ 2^max_depth leaves
+    min_samples_leaf = self.min_samples_leaf,
+    random_state     = self.random_state
+)
+tree.fit(X_sub, residuals)   # fit to (features, pseudo-residuals)
+```
+
+`max_depth=3` means at most 8 leaves — each tree is a "stump-like" weak learner.
+
+---
+
+## Step 3d — Re-Optimise Leaf Values (Optimal Gamma per Leaf)
+
+The tree was fitted to residuals, so its leaf values minimise squared residuals, not the actual loss. We **discard the tree's leaf predictions** and replace them with the optimal constant for the true loss in each leaf:
+
+```
+gamma_{jm} = argmin_{gamma}  sum_{x_i in R_{jm}} L(y_i, F_{m-1}(x_i) + gamma)
+```
+
+| Loss | Optimal gamma | Method |
+|---|---|---|
+| MSE | mean(y_i - F_{m-1}(x_i)) over the leaf | Closed-form |
+| Logistic | sum(r_i) / sum(p_i*(1-p_i)) over the leaf | One-step Newton-Raphson |
+
+**Code — MSE gamma** (`utils.py`, lines 35-43):
+```python
+def mse_optimal_gamma(y_true, y_pred):
+    """Closed form: gamma* = mean of residuals in this leaf."""
+    residuals = y_true - y_pred
+    return np.mean(residuals)
+```
+
+**Code — Logistic gamma** (`utils.py`, lines 77-109):
+```python
+def logistic_optimal_gamma(y_true, y_pred_raw, negative_gradients):
+    """
+    Newton step: gamma* = sum(r_i) / sum(p_i*(1-p_i))
+    Numerator  = first-order gradient sum
+    Denominator = second-order Hessian sum = p*(1-p)
+    """
+    p           = sigmoid(y_pred_raw)
+    w           = np.clip(p * (1 - p), 1e-15, None)   # Hessian diagonal
+    numerator   = np.sum(negative_gradients)
+    denominator = np.sum(w)
+    return 0.0 if denominator == 0 else numerator / denominator
+```
+
+**Code — Build gamma map per leaf** (`core.py`, lines 160-167):
+```python
+leaf_indices_sub = tree.apply(X_sub)          # integer leaf-ID for each training sample
+unique_leaves    = np.unique(leaf_indices_sub)
+
+gamma_map = {}                                 # {leaf_id: optimal_gamma}
+for leaf_id in unique_leaves:
+    mask = (leaf_indices_sub == leaf_id)
+    gamma_map[leaf_id] = mse_optimal_gamma(y_sub[mask], F_sub[mask])
+    # or logistic_optimal_gamma for the classifier
+```
+
+`tree.apply(X)` routes every sample through the already-fitted tree and returns its leaf ID — no re-fitting involved.
+
+---
+
+## Step 3e — Update the Running Prediction (Shrinkage)
+
+The ensemble prediction is updated by adding this tree's contribution, scaled by the **learning rate** nu:
+
+```
+F_m(x) = F_{m-1}(x)  +  nu * sum_j gamma_{jm} * I[x in R_{jm}]
+```
+
+A smaller nu means each tree contributes less — the model learns more slowly but generalises better.
+
+**Code** (`core.py`, lines 169-176):
+```python
+leaf_indices_train = tree.apply(X)              # assign ALL training samples to leaves
+update = np.array([
+    gamma_map.get(leaf, 0.0) for leaf in leaf_indices_train
+])                                              # gamma for each sample's leaf
+F_train += self.learning_rate * update          # nu * gamma applied to every sample
+
+self.estimators_.append(tree)                   # store tree for prediction
+self.leaf_values_.append(gamma_map)             # store gamma map for prediction
+```
+
+`gamma_map.get(leaf, 0.0)`: if a leaf was not seen during subsampled training, default to 0 update.
+
+---
+
+## Step 4 — Prediction
+
+At prediction time, the model replays the boosting loop — starting from `F_0` and applying each stored tree's leaf-gamma map in order.
+
+**Code — `_predict_raw`** (`core.py`, lines 199-222 for regression; lines 351-374 for classification):
 ```python
 def _predict_raw(self, X, up_to_iteration=None):
-    n_estimators = up_to_iteration if up_to_iteration else len(self.estimators_)
-    F = np.full(X.shape[0], self.f0_)          # Start at constant baseline
+    n_est = up_to_iteration or len(self.estimators_)
+    F = np.full(X.shape[0], self.f0_)           # start at constant baseline
 
-    for m in range(n_estimators):
+    for m in range(n_est):
         tree      = self.estimators_[m]
         gamma_map = self.leaf_values_[m]
-        leaf_indices = tree.apply(X)
-        update = np.array([gamma_map.get(leaf, 0.0) for leaf in leaf_indices])
-        F += self.learning_rate * update       # accumulate each tree's contribution
+        leaf_ids  = tree.apply(X)               # route X through tree m
+        update    = np.array([gamma_map.get(l, 0.0) for l in leaf_ids])
+        F        += self.learning_rate * update  # accumulate each tree's contribution
 
-    return F
+    return F   # regression: return F directly
+               # classification: apply sigmoid to get P(y=1)
 ```
 
-### Code — Classification probability (`core.py`, lines 376–387)
+**For classification** (`core.py`, lines 376-387):
 ```python
 def predict_proba(self, X):
     F = self._predict_raw(X)    # raw log-odds
-    return sigmoid(F)           # convert to probability
+    return sigmoid(F)           # P(y=1 | x)
+
+def predict(self, X):
+    return (self.predict_proba(X) >= 0.5).astype(int)
 ```
 
 ---
 
-## 1.9 Loss Functions Summary
+## Step 5 — Evaluate
 
-| Loss | Formula | Negative Gradient | Leaf Optimum |
-|---|---|---|---|
-| MSE | `0.5(y−F)²` | `y − F` | `mean(residuals in leaf)` |
-| Logistic | `−y·log(p)−(1−y)·log(1−p)` | `y − σ(F)` | `Σr_i / Σp_i(1−p_i)` (Newton step) |
-
-### Code — Sigmoid helper (`utils.py`, lines 112–118)
-```python
-def sigmoid(x):
-    """Numerically stable sigmoid — two branches to avoid overflow."""
-    return np.where(
-        x >= 0,
-        1 / (1 + np.exp(-x)),
-        np.exp(x) / (1 + np.exp(x))
-    )
-```
+- **Regression**: MSE on train, val, test. `train_scores_` and `val_scores_` lists track MSE per iteration for learning-curve plots.
+- **Classification**: Log-loss, accuracy, ROC-AUC, confusion matrix.
 
 ---
 
-## 1.10 Likely Viva Questions
+## Key Hyperparameters and Their Role
 
-| Question | Short Answer | Where in Code |
+| Hyperparameter | Role | Where set |
 |---|---|---|
-| Why use a regression tree for classification? | Pseudo-residuals are continuous — we need to fit a real value. | `core.py` line 301 |
-| What is the role of learning rate? | Shrinkage — multiplies every leaf update, prevents overfitting. | `core.py` line 172 |
-| What is the difference between γ for MSE vs logistic? | MSE: mean of residuals (exact). Logistic: Newton step (1st-order approx). | `utils.py` lines 35–109 |
-| Why re-optimise leaf values after tree fitting? | Tree minimises squared residuals, not the actual loss — re-computing γ per leaf aligns with the true objective. | `core.py` lines 160–167 |
-| What is stochastic boosting? | Row subsampling per iteration — reduces variance, regularises. | `core.py` lines 79–86 |
-| What is stored in `leaf_values_`? | A list (one per tree) of `{leaf_id: γ}` dicts — the optimal constant per leaf. | `core.py` line 176 |
+| `n_estimators` M | Number of trees / boosting stages | `GradientBoostingBase.__init__` |
+| `learning_rate` nu | Shrinkage — scales each tree's update | `F_train += lr * update` |
+| `max_depth` | Controls tree complexity (J leaves) | `DecisionTreeRegressor(max_depth=...)` |
+| `subsample` | Fraction of rows per iteration (stochastic) | `_subsample_indices` |
+| `min_samples_leaf` | Minimum samples per leaf (regularises trees) | `DecisionTreeRegressor(...)` |
+
+---
+
+## Viva Q&A — Assignment 1
+
+| Question | Concise Answer | Code location |
+|---|---|---|
+| What is the task? | Implement GBT from scratch for regression (California Housing) and classification (Breast Cancer) | `core.py`, `utils.py` |
+| First thing done before any tree? | Initialise F_0: mean(y) for MSE, log-odds for logistic | `core.py` L127-129, L273-279 |
+| Why pseudo-residuals, not raw residuals? | To extend boosting to any differentiable loss — they are the negative gradient | `utils.py` L25-32, L61-74 |
+| Why `DecisionTreeRegressor` for classification? | Pseudo-residuals are continuous — we need regression, not classification | `core.py` L301 |
+| Why re-compute gamma after tree fitting? | The tree minimised squared residuals, not the true loss — gamma is the exact optimal update | `utils.py` L35-109, `core.py` L160-167 |
+| What does learning rate do? | Scales the leaf update `F += nu*gamma` — smaller nu reduces overfitting | `core.py` L172 |
+| What is stochastic boosting? | Row subsampling per iteration — adds regularisation, reduces variance | `core.py` L79-86 |
+| What is stored in `estimators_` and `leaf_values_`? | List of fitted trees; list of `{leaf_id: gamma}` dicts | `core.py` L174-176 |
+| How does predict work at test time? | Start from F_0, route X through each stored tree, look up gamma, accumulate nu*gamma | `core.py` L199-222 |
 
 ---
 ---
 
-# Assignment 2 — Gaussian Processes (GP)
+# Assignment 2 — Gaussian Processes
+
+## What Is the Assignment Task?
+
+**Goal**: Implement **Gaussian Process regression and binary classification from scratch**, following algorithms directly from Rasmussen & Williams, *Gaussian Processes for Machine Learning* (2006):
+
+- **Algorithm 2.1** — Exact GP Regression with hyperparameter optimisation via log marginal likelihood.
+- **Algorithm 3.1** — Posterior mode via Newton's method (Laplace approximation for classification).
+- **Algorithm 3.2** — Predictive probabilities for GP classification.
+
+Applied to two tasks:
+1. **Regression** on the *Diabetes* dataset — predict disease progression with uncertainty bands (RMSE, NLPD).
+2. **Binary Classification** on the *Breast Cancer Wisconsin* dataset — classify malignant/benign with calibrated probabilities (ROC-AUC, calibration curve).
 
 **Source files**: `Assignment2/src/gp/base.py`, `kernels.py`, `regression.py`, `classification.py`  
-**Reference**: Rasmussen & Williams, *Gaussian Processes for Machine Learning* (2006), Algorithms 2.1, 3.1, 3.2.
+**Experiment scripts**: `Assignment2/experiments/regression_demo.py`, `classification_demo.py`
+
+A Gaussian Process does not predict a single value — it predicts a **full Gaussian distribution** over possible function values at every test point, giving **uncertainty quantification for free**: high uncertainty far from training data or near class boundaries, low uncertainty near dense training data.
 
 ---
 
-## 2.1 What Is a Gaussian Process?
-
-A Gaussian Process (GP) defines a **distribution over functions**: any finite collection of function values `f(x_1), …, f(x_n)` is jointly Gaussian:
+## Part A — GP Regression Pipeline
 
 ```
-f(x) ~ GP(m(x),  k(x, x'))
+Raw Data (Diabetes dataset, 442 samples, 10 features)
+  |
+  v
+Step A1 -- Load & Split Data  (train/test)
+  |
+  v
+Step A2 -- Choose a Kernel  (encodes smoothness assumptions about f)
+  |
+  v
+Step A3 -- Fit
+  |         Compute K = k(X,X) + sigma_n^2 * I
+  |         Cholesky: L = chol(K)
+  |         Alpha:    alpha = L^T \ (L \ y)   [= K^{-1}y]
+  v
+Step A4 -- Optimise Hyperparameters
+  |         Maximise log p(y|X,theta) via L-BFGS-B
+  |         (multiple random restarts, log-space search)
+  v
+Step A5 -- Predict
+  |         mean  = K_*^T * alpha
+  |         var   = k(x_*,x_*) - v^T*v,   v = L^{-1}*K_*
+  v
+Step A6 -- Evaluate: RMSE, NLPD, predictive-band plots
 ```
-
-- `m(x)` — mean function (usually zero).
-- `k(x, x')` — **kernel** (covariance function) encodes assumptions about smoothness.
-
-GPs are non-parametric: the model complexity grows with data.
 
 ---
 
-## 2.2 Kernels
+### A1. Load and Split Data
 
-A kernel `k(x, x')` measures similarity between inputs. The kernel matrix `K_{ij} = k(x_i, x_j)` must be **symmetric positive semi-definite**.
+**Code** (`regression_demo.py`, lines 47-53):
+```python
+diabetes = load_diabetes()
+X, y     = diabetes.data, diabetes.target
 
-### 2.2.1 RBF (Squared Exponential) Kernel
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, random_state=42
+)
+```
+The kernel hyperparameters (length-scale) adapt to the data scale during optimisation, so explicit standardisation is not strictly required.
 
-**Theory**: `k(x, x') = σ² · exp(−‖x−x'‖² / (2ℓ²))`
+---
 
-Infinite differentiability. `ℓ` = length-scale (how quickly correlation decays), `σ²` = signal variance.
+### A2. Choose a Kernel
 
-**Code** (`Assignment2/src/gp/kernels.py`, lines 86–101)
+A kernel `k(x, x')` measures similarity between inputs and determines the smoothness of functions the GP can represent. All kernels inherit from an abstract `Kernel` base class (`kernels.py`, line 16).
+
+#### RBF (Squared Exponential)
+```
+k(x, x') = sigma^2 * exp(-||x-x'||^2 / (2*l^2))
+```
+Infinitely differentiable. `l` = length-scale, `sigma^2` = signal variance.
+
+**Code** (`Assignment2/src/gp/kernels.py`, lines 86-101):
 ```python
 class RBF(Kernel):
     def __call__(self, X1, X2=None, diag=False):
         dists_sq = self._squared_distances(X1, X2)
-        K = self.variance * np.exp(-0.5 * dists_sq / (self.length_scale ** 2))
-        return K
+        return self.variance * np.exp(-0.5 * dists_sq / (self.length_scale ** 2))
 
     def _squared_distances(self, X1, X2):
-        # ||x-x'||² = ||x||² - 2<x,x'> + ||x'||²  (efficient, no loops)
-        X1_sq = np.sum(X1 ** 2, axis=1, keepdims=True)
-        X2_sq = np.sum(X2 ** 2, axis=1, keepdims=True)
+        # ||x-x'||^2 = ||x||^2 - 2<x,x'> + ||x'||^2  (vectorised, no loops)
+        X1_sq = np.sum(X1**2, axis=1, keepdims=True)
+        X2_sq = np.sum(X2**2, axis=1, keepdims=True)
         return np.maximum(X1_sq + X2_sq.T - 2 * X1 @ X2.T, 0.0)
 ```
 
-### 2.2.2 Matérn Kernel
+#### Matern Kernel (nu=3/2 or nu=5/2)
+```
+nu=3/2: k(r) = sigma^2*(1 + sqrt(3)*r/l)*exp(-sqrt(3)*r/l)          -- once-differentiable
+nu=5/2: k(r) = sigma^2*(1 + sqrt(5)*r/l + 5r^2/(3l^2))*exp(-sqrt(5)*r/l)  -- twice-differentiable
+```
 
-**Theory**:
-- ν = 3/2: `k(r) = σ²(1 + √3·r/ℓ)·exp(−√3·r/ℓ)` — once-differentiable.
-- ν = 5/2: `k(r) = σ²(1 + √5·r/ℓ + 5r²/(3ℓ²))·exp(−√5·r/ℓ)` — twice-differentiable.
-
-**Code** (`Assignment2/src/gp/kernels.py`, lines 183–190)
+**Code** (`Assignment2/src/gp/kernels.py`, lines 183-190):
 ```python
 if self.nu == 1.5:
     scaled = np.sqrt(3.0) * dists / self.length_scale
     K = self.variance * (1.0 + scaled) * np.exp(-scaled)
-else:  # nu == 2.5
+else:  # nu=2.5
     scaled = np.sqrt(5.0) * dists / self.length_scale
     K = self.variance * (1.0 + scaled + scaled**2 / 3.0) * np.exp(-scaled)
 ```
 
-### 2.2.3 Rational Quadratic Kernel
+#### Hyperparameters Stored in Log Space
 
-**Theory**: `k(x, x') = σ²(1 + ‖x−x'‖²/(2αℓ²))^{−α}` — infinite mixture of RBFs with different length-scales.
-
-**Code** (`Assignment2/src/gp/kernels.py`, lines 268–271)
+Kernels store parameters in log space so the optimiser can search over all reals without violating positivity (`Assignment2/src/gp/kernels.py`, lines 111-118):
 ```python
-dists_sq = self._squared_distances(X1, X2)
-base = 1.0 + dists_sq / (2.0 * self.alpha * self.length_scale ** 2)
-K = self.variance * (base ** (-self.alpha))
-```
-
-### 2.2.4 Hyperparameters in Log Space
-
-All kernels store and optimise hyperparameters **in log space** (via `get_params` / `set_params`), enabling unconstrained gradient-based optimisation while guaranteeing positivity.
-
-**Code** (`Assignment2/src/gp/kernels.py`, lines 111–118 for RBF)
-```python
-def get_params(self) -> np.ndarray:
+def get_params(self):
     return np.array([np.log(self.length_scale), np.log(self.variance)])
 
-def set_params(self, params: np.ndarray) -> None:
-    self.length_scale = np.exp(params[0])   # ensures ℓ > 0
-    self.variance     = np.exp(params[1])   # ensures σ² > 0
+def set_params(self, params):
+    self.length_scale = np.exp(params[0])   # always > 0
+    self.variance     = np.exp(params[1])   # always > 0
 ```
 
 ---
 
-## 2.3 Numerically Stable Cholesky Decomposition
+### A3. Fit — Cholesky Decomposition and Alpha (Algorithm 2.1, Steps 1-3)
 
-### Theory
-GP inference requires computing `K^{-1}y`. Direct inversion is numerically unstable and O(n³). The Cholesky decomposition `K = LL^T` (L lower-triangular) is the standard approach:
+GP inference requires solving `K^{-1}*y`. Direct inversion is numerically unstable. The Cholesky decomposition `K = L*L^T` is used instead.
 
-1. `K = LL^T`
-2. Solve `Lα' = y` (forward substitution)
-3. Solve `L^Tα = α'` (backward substitution)
+```
+K      = k(X,X) + sigma_n^2 * I    (n x n)
+L      = cholesky(K)                (lower triangular)
+alpha  = L^T \ (L \ y)             = K^{-1}*y  without explicit inversion
+```
 
-If `K` is near-singular, adding a small diagonal **jitter** `ε·I` restores positive definiteness.
-
-### Code — Adaptive Jitter Cholesky (`base.py`, lines 39–54)
+**Code — Adaptive Jitter Cholesky** (`Assignment2/src/gp/base.py`, lines 39-54):
 ```python
 def stable_cholesky(K, jitter=1e-6):
-    jitter_levels = [jitter, 1e-5, 1e-4, 1e-3, 1e-2]
-    for j in jitter_levels:
+    """Try progressively larger jitter until Cholesky succeeds."""
+    for j in [1e-6, 1e-5, 1e-4, 1e-3, 1e-2]:
         try:
-            L = np.linalg.cholesky(K + np.eye(K.shape[0]) * j)
-            return L
+            return np.linalg.cholesky(K + np.eye(K.shape[0]) * j)
         except np.linalg.LinAlgError:
-            continue     # try larger jitter
+            continue
     raise np.linalg.LinAlgError("Cholesky failed even with max jitter")
 ```
-If the first jitter level fails (matrix not positive definite), progressively larger values are tried.
+Jitter is a small diagonal term that restores positive-definiteness when K is near-singular.
 
-### Code — Cholesky Solve (`base.py`, lines 57–79)
+**Code — Two-Step Cholesky Solve** (`Assignment2/src/gp/base.py`, lines 57-79):
 ```python
 def cholesky_solve(L, b):
-    """Solve K x = b given L s.t. K = LL^T."""
-    y = np.linalg.solve(L,    b)    # forward: L y  = b
-    x = np.linalg.solve(L.T,  y)   # backward: L^T x = y
-    return x
+    """Solve K*x = b given L such that K = L*L^T."""
+    y = np.linalg.solve(L,   b)   # forward:  L*y = b
+    x = np.linalg.solve(L.T, y)   # backward: L^T*x = y
+    return x                       # x = K^{-1}*b
+```
+
+**Code — `_compute_alpha`** (`Assignment2/src/gp/regression.py`, lines 117-131):
+```python
+def _compute_alpha(self):
+    n  = self.X_train_.shape[0]
+    K  = self.kernel(self.X_train_, self.X_train_)   # n x n kernel matrix
+    K += np.eye(n) * self.noise                       # K + sigma_n^2 * I
+
+    self.L_     = stable_cholesky(K, jitter=1e-6)    # L = chol(K)
+    self.alpha_ = cholesky_solve(self.L_, self.y_train_)  # alpha = K^{-1}*y
+```
+`alpha_` is precomputed and cached — all predictions use it without re-solving.
+
+---
+
+### A4. Optimise Hyperparameters — Log Marginal Likelihood
+
+The hyperparameters `theta = (l, sigma^2, sigma_n^2)` are chosen by maximising the **log marginal likelihood**:
+
+```
+log p(y|X,theta) = -0.5 * y^T K^{-1} y  -  0.5 * log|K|  -  n/2 * log(2*pi)
+                   -----------------         -----------       --------------
+                    data-fit term             complexity          constant
+```
+
+The data-fit term rewards fitting training data; the log-determinant penalises overly complex models. Together they provide automatic Occam's razor.
+
+**Code — Log Marginal Likelihood** (`Assignment2/src/gp/base.py`, lines 82-124):
+```python
+def log_marginal_likelihood(y, K, L=None, jitter=1e-6):
+    if L is None:
+        L = stable_cholesky(K, jitter)
+
+    alpha    = cholesky_solve(L, y)
+    data_fit = -0.5 * np.dot(y, alpha)            # -0.5 * y^T K^{-1} y
+
+    log_det  = -np.sum(np.log(np.diag(L)))         # -0.5 * log|K| = -sum(log L_ii)
+    const    = -0.5 * len(y) * np.log(2 * np.pi)
+
+    return data_fit + log_det + const
+```
+`log|K| = 2*sum(log L_ii)` because `K = L*L^T` so `|K| = (prod L_ii)^2`.
+
+**Code — L-BFGS-B Optimisation** (`Assignment2/src/gp/regression.py`, lines 236-302):
+```python
+def _optimise_hyperparameters(self):
+    def objective(params):                              # minimise negative LML
+        self.kernel.set_params(params[:-1])             # update l, sigma^2 in log space
+        self.noise = np.exp(params[-1])                 # update noise sigma_n^2
+        self._compute_alpha()                           # recompute L and alpha
+        return -self.log_marginal_likelihood_value()    # negate to minimise
+
+    initial = np.concatenate([self.kernel.get_params(), [np.log(self.noise)]])
+    bounds  = [(-10, 10) for _ in initial]
+
+    for restart in range(self.n_restarts + 1):
+        x0 = initial if restart == 0 else np.random.uniform(-2, 2, initial.shape)
+        result = minimize(objective, x0, method='L-BFGS-B', bounds=bounds)
+        # keep best result across restarts
 ```
 
 ---
 
-## 2.4 GP Regression — Algorithm 2.1
-
-### Theory
-Given training data `(X, y)` with `y = f(X) + ε`, `ε ~ N(0, σ_n²I)`, the posterior is:
+### A5. Predict — Posterior Mean and Variance (Algorithm 2.1, Steps 4-5)
 
 ```
-p(f_*|X, y, x_*) = N(f̄_*, V[f_*])
-f̄_*  = K_*^T α,             where α = (K + σ_n²I)^{-1} y
-V[f_*] = k(x_*,x_*) − v^T v,  where v = L^{-1} K_*
+f_bar_*  = K_*^T * alpha                (posterior mean)
+V[f_*]   = k(x_*,x_*) - v^T*v,   v = L^{-1} * K_*   (posterior variance)
 ```
+The variance is the prior variance `k(x_*,x_*)` minus the reduction from observing training data.
 
-### Code — `_compute_alpha` (`regression.py`, lines 117–131) — Steps 1–3 of Alg. 2.1
-```python
-def _compute_alpha(self):
-    n = self.X_train_.shape[0]
-    K  = self.kernel(self.X_train_, self.X_train_)  # n×n kernel matrix
-    K += np.eye(n) * self.noise                      # add noise: K + σ_n²I
-
-    self.L_     = stable_cholesky(K, jitter=1e-6)   # Step 2: Cholesky K = LL^T
-    self.alpha_ = cholesky_solve(self.L_, self.y_train_)  # Step 3: α = K^{-1}y
-```
-
-### Code — `predict` (`regression.py`, lines 133–191) — Steps 4–5 of Alg. 2.1
+**Code — `predict`** (`Assignment2/src/gp/regression.py`, lines 133-191):
 ```python
 def predict(self, X, return_std=False, return_cov=False):
-    K_star = self.kernel(self.X_train_, X)         # Step 4: K_* = k(X_train, X_test)
-    mean   = K_star.T.dot(self.alpha_)              # f̄_* = K_*^T α
+    K_star = self.kernel(self.X_train_, X)          # K_* = k(X_train, X_test)
+    mean   = K_star.T @ self.alpha_                  # f_bar_* = K_*^T * alpha
 
     if return_std:
-        v   = np.linalg.solve(self.L_, K_star)      # v = L^{-1} K_*
-        var = self.kernel(X, X, diag=True) - np.sum(v**2, axis=0)  # k_** - v^T v
-        var = np.maximum(var, 0.0)                  # numerical safety
+        v   = np.linalg.solve(self.L_, K_star)      # v = L^{-1} * K_*
+        var = self.kernel(X, X, diag=True) - np.sum(v**2, axis=0)
+        var = np.maximum(var, 0.0)                   # clip numerical negatives to 0
         return mean, np.sqrt(var)
 
     if return_cov:
         v   = np.linalg.solve(self.L_, K_star)
-        cov = self.kernel(X, X) - v.T.dot(v)
-        cov = 0.5 * (cov + cov.T)                  # ensure exact symmetry
+        cov = self.kernel(X, X) - v.T @ v
+        cov = 0.5 * (cov + cov.T)                   # enforce exact symmetry
         return mean, cov
 ```
 
 ---
 
-## 2.5 Log Marginal Likelihood (LML)
+### A6. Evaluate
 
-### Theory
-Hyperparameters (`ℓ`, `σ²`, `σ_n²`) are chosen by maximising the **log marginal likelihood**:
-
-```
-log p(y|X,θ) = −½ y^T K^{-1} y  −  ½ log|K|  −  n/2 · log(2π)
-              ─────────────────    ───────────    ──────────────
-               data fit             complexity       constant
-```
-
-The data-fit term rewards fitting `y`, while the complexity term penalises overly complex `K`, providing automatic Occam's razor.
-
-### Code (`base.py`, lines 82–124)
+**Code** (`regression_demo.py`, lines 86-94):
 ```python
-def log_marginal_likelihood(y, K, L=None, jitter=1e-6):
-    if L is None:
-        L = stable_cholesky(K, jitter=jitter)
+y_pred_mean, y_pred_std = gp.predict(X_test, return_std=True)
 
-    alpha    = cholesky_solve(L, y)
-    data_fit = -0.5 * np.dot(y, alpha)          # -½ y^T K^{-1} y
-
-    log_det  = -np.sum(np.log(np.diag(L)))       # -½ log|K| = -Σ log(L_ii)
-    const    = -0.5 * len(y) * np.log(2 * np.pi)
-
-    return data_fit + log_det + const
-```
-`log|K| = 2·Σ log(L_ii)` because `|K| = |L|² = (∏ L_ii)²`.
-
----
-
-## 2.6 Hyperparameter Optimisation (L-BFGS-B)
-
-### Theory
-Maximise `log p(y|X,θ)` w.r.t. `θ = (log ℓ, log σ², log σ_n²)` using L-BFGS-B. Multiple random restarts guard against local optima.
-
-### Code (`regression.py`, lines 236–302)
-```python
-def _optimise_hyperparameters(self):
-    def objective(params):          # minimise NEGATIVE LML
-        self.kernel.set_params(params[:-1])    # update kernel hyperparams
-        self.noise = np.exp(params[-1])        # update noise (positive by exp)
-        self._compute_alpha()                  # recompute L and α
-        lml = self.log_marginal_likelihood_value()
-        return -lml                            # negate for minimisation
-
-    initial_params = np.concatenate([self.kernel.get_params(), [np.log(self.noise)]])
-    bounds = [(-10, 10) for _ in initial_params]    # log-space bounds
-
-    for restart in range(self.n_restarts + 1):
-        x0 = initial_params if restart == 0 else np.random.uniform(-2, 2, ...)
-        result = minimize(objective, x0=x0, method='L-BFGS-B', bounds=bounds)
-        ...  # keep best result
+rmse = np.sqrt(mean_squared_error(y_test, y_pred_mean))
+# NLPD penalises both wrong mean and wrong uncertainty:
+nlpd = negative_log_predictive_density(y_test, y_pred_mean, y_pred_std)
 ```
 
 ---
 
-## 2.7 GP Classification — Laplace Approximation
+## Part B — GP Classification Pipeline
 
-### Theory
-For classification, the likelihood `p(y|f)` is non-Gaussian (logistic or probit), making exact inference intractable. The **Laplace approximation** fits a Gaussian `q(f|X,y) = N(f | f̂, (K^{-1} + W)^{-1})` at the posterior mode `f̂`.
+```
+Raw Data (Breast Cancer dataset, 569 samples, 30 features)
+  |
+  v
+Step B1 -- Load & Split Data
+  |
+  v
+Step B2 -- Choose Kernel + Create GaussianProcessClassifier
+  |
+  v
+Step B3 -- Fit: find posterior mode f_hat  [Algorithm 3.1 -- Newton iterations]
+  |         Initialise f = 0
+  |         Repeat until convergence:
+  |           W  = diag(-d^2 log p(y|f)/df^2)     -- negative Hessian (curvature)
+  |           b  = W*f + d log p(y|f)/df           -- Newton direction
+  |           B  = I + W^{1/2} K W^{1/2}
+  |           L  = chol(B)
+  |           a  = b - W^{1/2} L^T\(L\(W^{1/2}*K*b))
+  |           f  <- K*a
+  v
+Step B4 -- Predict probabilities  [Algorithm 3.2]
+  |         f_bar_*  = k(X,x_*)^T * d log p(y|f_hat)/df
+  |         V[f_*]   = k(x_*,x_*) - v^T*v
+  |         pi_star ~= Phi(kappa*f_bar_* / sqrt(1 + kappa^2*V[f_*]))  [probit approx]
+  v
+Step B5 -- Evaluate: ROC-AUC, calibration curve, 2D probability heatmap
+```
 
-**Algorithm 3.1 — Newton's Method for Posterior Mode:**
-1. Initialise `f = 0`.
-2. Repeat:
-   - `W = diag(−∇∇ log p(y|f))` (negative Hessian, diagonal)
-   - `b = Wf + ∇ log p(y|f)`
-   - `B = I + W^{1/2} K W^{1/2}`
-   - `L = chol(B)`
-   - `a = b − W^{1/2} L^T\(L\(W^{1/2} K b))`
-   - `f ← Ka`
-3. Until `‖f_new − f‖ < tol`.
+---
 
-### Code — Newton Loop (`classification.py`, lines 121–171)
+### B3. Fit — Newton's Method for Posterior Mode (Algorithm 3.1)
+
+**Theory**: For classification the likelihood `p(y|f)` is non-Gaussian (sigmoid/probit). The exact posterior is intractable. The **Laplace approximation** finds the posterior **mode** f_hat using Newton's method, then fits a Gaussian at that point.
+
+`W = diag(-d^2 log p(y|f)/df^2)` is the negative Hessian of the log-likelihood (diagonal). Points near the decision boundary (p ~ 0.5) have the highest W and contribute most to the Newton step.
+
+**Code — Newton Loop** (`Assignment2/src/gp/classification.py`, lines 121-162):
 ```python
-n = X.shape[0]
-f = np.zeros(n)   # Initialise at zero
+f = np.zeros(n)                     # initialise at zero
 
 for iteration in range(self.max_iter):
-    # Gradient and Hessian of log-likelihood
-    grad_log_lik = self._gradient_log_likelihood(f, y)   # ∇ log p(y|f)
-    W = self._hessian_log_likelihood(f, y)               # diag of -∇∇ log p(y|f)
+    grad_log_lik = self._gradient_log_likelihood(f, y)   # d log p(y|f)/df
+    W            = self._hessian_log_likelihood(f, y)    # diag of -d^2 log p(y|f)/df^2
 
     # Build B = I + W^{1/2} K W^{1/2}
-    W_sqrt    = np.sqrt(W)
-    W_sqrt_K  = W_sqrt[:, np.newaxis] * self.K_          # W^{1/2} K
-    B         = np.eye(n) + W_sqrt_K * W_sqrt[np.newaxis, :]
+    W_sqrt   = np.sqrt(W)
+    W_sqrt_K = W_sqrt[:, np.newaxis] * self.K_           # W^{1/2} K
+    B        = np.eye(n) + W_sqrt_K * W_sqrt[np.newaxis, :]
 
     L = stable_cholesky(B, jitter=self.noise)            # L = chol(B)
 
-    b          = W * f + grad_log_lik                    # b = Wf + ∇log p
-    W_sqrt_K_b = W_sqrt_K.dot(b)                         # W^{1/2} K b
+    b          = W * f + grad_log_lik                    # b = W*f + d log p
+    W_sqrt_K_b = W_sqrt_K @ b
     c          = np.linalg.solve(L, W_sqrt_K_b)
-    c          = np.linalg.solve(L.T, c)                 # (L L^T)^{-1} W^{1/2} K b
-    a          = b - W_sqrt * c                          # a = b - W^{1/2} L^T\(L\...)
-    f_new      = self.K_.dot(a)                          # f ← Ka
+    c          = np.linalg.solve(L.T, c)
+    a          = b - W_sqrt * c
+    f_new      = self.K_ @ a                             # f <- K*a
 
-    delta = np.max(np.abs(f_new - f))
-    f = f_new
-    if delta < self.tol:
+    if np.max(np.abs(f_new - f)) < self.tol:             # convergence check
         break
+    f = f_new
 ```
 
-### 2.7.1 Gradient and Hessian of Log-Likelihood
-
-| Likelihood | `∇ log p(y|f)` | `-∇∇ log p(y|f)` (W) |
-|---|---|---|
-| Logistic | `t − σ(f)`, where `t = (y+1)/2` | `σ(f)·(1−σ(f))` |
-| Probit | `y·N(yf)·Φ(yf)^{-1}` | `z(z + yf)`, `z = N/Φ` |
-
-**Code — Gradient** (`classification.py`, lines 296–313)
+**Gradient and Hessian for logistic likelihood** (`Assignment2/src/gp/classification.py`, lines 296-339):
 ```python
 def _gradient_log_likelihood(self, f, y):
-    if self.likelihood == 'logistic':
-        pi = self._sigmoid(f)
-        t  = (y + 1.0) / 2.0      # {-1,+1} → {0,1}
-        return t - pi              # residual in probability space
-    else:  # probit
-        yf = y * f
-        norm_pdf = np.exp(-0.5*yf**2) / np.sqrt(2*np.pi)
-        norm_cdf = self._probit_sigmoid(yf)
-        return y * norm_pdf / norm_cdf
-```
+    # y in {-1,+1};  t = (y+1)/2 in {0,1}
+    t  = (y + 1.0) / 2.0
+    pi = self._sigmoid(f)
+    return t - pi            # = t - sigma(f)
 
-**Code — Hessian (W)** (`classification.py`, lines 315–339)
-```python
 def _hessian_log_likelihood(self, f, y):
-    if self.likelihood == 'logistic':
-        pi = self._sigmoid(f)
-        W  = pi * (1.0 - pi)       # σ(f)(1-σ(f))
-    else:  # probit
-        yf = y * f
-        z  = norm_pdf / norm_cdf
-        W  = z * (z + yf)
-    return np.maximum(W, 1e-10)    # ensure numerical positivity
+    pi = self._sigmoid(f)
+    W  = pi * (1.0 - pi)     # W = sigma(f)*(1-sigma(f))
+    return np.maximum(W, 1e-10)
 ```
 
 ---
 
-## 2.8 GP Classification — Algorithm 3.2 (Predictions)
+### B4. Predict — Algorithm 3.2
 
-### Theory
-Predictive probability at test point `x_*`:
+The integral of `sigma(f)*N(f|mu,sigma^2)` has no closed form for logistic -> use the **probit approximation**: `sigma(f) ~= Phi(kappa*f)`, `kappa^2 = pi/8`.
 
-```
-f̄_* = k(X, x_*)^T · ∇ log p(y|f̂)
-V[f_*] = k(x_*,x_*) − v^T v,   v = L^{-1}(W^{1/2} k(X, x_*))
-π̄_* = ∫ σ(f_*) N(f_* | f̄_*, V[f_*]) df_*
-```
-
-The integral has no closed form for logistic — approximated using probit approximation.
-
-### Code — `predict_proba` (`classification.py`, lines 180–231)
+**Code — `predict_proba`** (`Assignment2/src/gp/classification.py`, lines 180-231):
 ```python
 def predict_proba(self, X):
-    k_star      = self.kernel(self.X_train_, X)              # k(X, X_*)
+    k_star       = self.kernel(self.X_train_, X)
     grad_log_lik = self._gradient_log_likelihood(self.f_hat_, self.y_train_)
-    f_bar       = k_star.T.dot(grad_log_lik)                 # posterior mean of f_*
+    f_bar        = k_star.T @ grad_log_lik          # posterior mean f_bar_*
 
-    W_sqrt      = np.sqrt(self.W_)
-    v           = np.linalg.solve(self.L_, W_sqrt[:, np.newaxis] * k_star)
-    k_star_star = self.kernel(X, X, diag=True)
-    var_f       = np.maximum(k_star_star - np.sum(v**2, axis=0), 0.0)
+    W_sqrt = np.sqrt(self.W_)
+    v      = np.linalg.solve(self.L_, W_sqrt[:, np.newaxis] * k_star)
+    var_f  = np.maximum(self.kernel(X, X, diag=True) - np.sum(v**2, axis=0), 0.0)
 
-    if self.likelihood == 'probit':
-        kappa     = 1.0 / np.sqrt(1.0 + var_f)
-        pi_star   = self._probit_sigmoid(kappa * f_bar)       # analytic
-    else:  # logistic — use probit approximation
-        pi_star   = self._logistic_averaged_probability(f_bar, var_f)
+    kappa_sq = np.pi / 8.0
+    pi_star  = self._probit_sigmoid(f_bar / np.sqrt(1.0 + kappa_sq * var_f))
 
-    proba = np.column_stack([1 - pi_star, pi_star])           # [P(0), P(1)]
-    return proba
-```
-
-### Code — Logistic Averaged Probability Approximation (`classification.py`, lines 341–350)
-```python
-def _logistic_averaged_probability(self, f_bar, var_f):
-    """σ(f) ≈ Φ(κf), κ² = π/8  →  integral ≈ Φ(κf̄ / √(1 + κ²V))"""
-    kappa_sq     = np.pi / 8.0
-    scaled_mean  = f_bar / np.sqrt(1.0 + kappa_sq * var_f)
-    return self._probit_sigmoid(scaled_mean)
+    return np.column_stack([1 - pi_star, pi_star])   # [P(y=0), P(y=1)]
 ```
 
 ---
 
-## 2.9 Likely Viva Questions
+## Viva Q&A — Assignment 2
 
-| Question | Short Answer | Where in Code |
+| Question | Concise Answer | Code location |
 |---|---|---|
-| Why Cholesky and not direct inverse? | More stable, O(n³) but with smaller constant; avoids catastrophic cancellation. | `base.py` lines 15–79 |
-| What is the log determinant computed from? | `log|K| = 2·Σ log(L_ii)` (diagonal of Cholesky). | `base.py` line 119 |
-| Why optimise in log space? | Guarantees hyperparameters remain positive without explicit constraints. | `kernels.py` lines 111–118 |
-| What does W represent in Alg. 3.1? | Diagonal of the negative Hessian — it's the local curvature of the log-likelihood. | `classification.py` lines 315–339 |
-| Why are labels converted to {-1, +1}? | Standard convention in GPML for logistic/probit formulas. | `classification.py` line 112 |
-| What is the Laplace approximation? | Replace intractable posterior with a Gaussian centred at the MAP estimate. | `classification.py` lines 81–171 |
-| How is predictive variance computed? | `k(x_*,x_*) − v^T v`, subtracting the variance "explained" by the training data. | `regression.py` lines 187–190 |
+| What is the task? | Implement GP regression (Alg 2.1) and GP classification (Alg 3.1/3.2) with uncertainty quantification | `regression.py`, `classification.py` |
+| What does a GP predict that a standard model does not? | A full Gaussian distribution — mean + variance (uncertainty) at every test point | `regression.py` L133-191 |
+| Why Cholesky instead of matrix inversion? | Numerically stable; avoids catastrophic cancellation; same O(n^3) complexity | `base.py` L39-54 |
+| What is alpha? | Pre-computed `K^{-1}*y` — used in every prediction as the "weights" | `regression.py` L131 |
+| What is the LML used for? | Selecting kernel hyperparameters — balances data fit vs. model complexity | `base.py` L82-124 |
+| What is the Laplace approximation? | Approximate the intractable posterior with a Gaussian centred at the MAP estimate f_hat | `classification.py` L81-178 |
+| What does W represent in Alg. 3.1? | Diagonal of the negative Hessian — local curvature of the log-likelihood | `classification.py` L315-339 |
+| How is predictive uncertainty computed? | Prior variance minus variance explained by data: `k(x_*,x_*) - v^T*v` | `regression.py` L187-190 |
+| Why use probit approximation? | The integral of sigma(f)*N(f|mu,sigma^2) has no closed form — probit makes it tractable | `classification.py` L341-350 |
 
 ---
 ---
 
-# Assignment 3 — Variational Autoencoders (VAE & CVAE)
+# Assignment 3 — Variational Autoencoders
 
-**Source files**: `Assignment3/part1_vae.py`, `Assignment3/part2_cvae.py`  
-**Dataset**: MNIST (28×28 greyscale digits, 60 000 train / 10 000 test).
+## What Is the Assignment Task?
 
----
+**Goal**: Implement a **Variational Autoencoder (VAE)** and a **Conditional VAE (CVAE)** from scratch on MNIST handwritten digits, demonstrating:
 
-## 3.1 What Is a VAE?
+1. **Part 1 (VAE)**: Unsupervised generative modelling — learn a structured latent space and generate new digit images from Gaussian noise. Visualise the latent space via PCA and latent interpolation.
+2. **Part 2 (CVAE)**: Conditional generative modelling — condition on a class label so specific digits can be generated on demand.
 
-A Variational Autoencoder is a **generative model** that learns a mapping between data space `x` and a structured latent space `z`. Unlike a plain autoencoder, the encoder outputs a distribution (`μ`, `σ²`) instead of a single point, forcing the latent space to be smooth and continuous.
+Both models include: log-variance reparameterisation, KL annealing (beta-VAE schedule), mixed-precision (AMP) training, and early stopping.
 
-The generative model is:
-```
-z ~ N(0, I)          (prior)
-x | z ~ p_θ(x|z)     (decoder / likelihood)
-```
-
-The approximate posterior (encoder) is:
-```
-q_φ(z|x) = N(z | μ_φ(x), diag(σ²_φ(x)))
-```
+**Source files**: `Assignment3/part1_vae.py`, `Assignment3/part2_cvae.py`
 
 ---
 
-## 3.2 Architecture
-
-### VAE (`part1_vae.py`, lines 109–192)
+## Part 1 — VAE Pipeline
 
 ```
-Input x (784)
-  ↓ Linear(784 → 400) + ReLU          enc_hidden / enc_mu / enc_log_var
-  ↓ Linear(400 → 20)  [two heads]     → μ  (Z_DIM=20)
-                                       → log_var  (Z_DIM=20)
-  ↓ Reparameterize: z = μ + σ·ε
-  ↓ Linear(20 → 400) + ReLU           dec_hidden
-  ↓ Linear(400 → 784)                 dec_out  (raw logits)
-Output x̂_logits (784)
+MNIST Dataset (60k train / 10k test, 28x28 greyscale pixels)
+  |
+  v
+Step 1 -- Load Data & Set Hyperparameters
+  |         INPUT_DIM=784, H_DIM=400, Z_DIM=20, BATCH_SIZE=128
+  v
+Step 2 -- Define VAE Architecture
+  |         Encoder: 784 -> [400 ReLU] -> mu (20) and log_var (20)
+  |         Decoder: 20  -> [400 ReLU] -> 784 raw logits
+  v
+Step 3 -- Forward Pass (per mini-batch)
+  |         3a. Encode:          x -> (mu, log_var)
+  |         3b. Reparameterize:  z = mu + sigma * eps,  eps ~ N(0,I)
+  |         3c. Decode:          z -> x_hat_logits
+  v
+Step 4 -- Compute ELBO Loss
+  |         Recon = BCEWithLogitsLoss(x_hat_logits, x) / batch_size
+  |         KL    = -0.5 * sum(1 + log_var - mu^2 - exp(log_var)) / batch_size
+  |         Loss  = Recon + beta * KL   (beta annealed 0->1)
+  v
+Step 5 -- Backward + AMP Update
+  |         scaler.scale(loss).backward()
+  |         scaler.step(optimizer); scaler.update()
+  v
+Step 6 -- Checkpointing + Early Stopping
+  |         Save best model; stop if no improvement for PATIENCE epochs after annealing
+  v
+Step 7 -- Visualise Outputs
+            Reconstructions, prior samples, latent space PCA, latent interpolation
 ```
 
-**Code — `__init__`** (`part1_vae.py`, lines 127–134)
+---
+
+### Step 1 — Load Data and Set Hyperparameters
+
+**Code** (`part1_vae.py`, lines 54-103):
 ```python
-# Encoder
-self.enc_hidden  = nn.Linear(input_dim, h_dim)    # 784 → 400
-self.enc_mu      = nn.Linear(h_dim,     z_dim)    # 400 → 20
-self.enc_log_var = nn.Linear(h_dim,     z_dim)    # 400 → 20  (two heads)
-# Decoder
-self.dec_hidden  = nn.Linear(z_dim,     h_dim)    # 20  → 400
-self.dec_out     = nn.Linear(h_dim,     input_dim) # 400 → 784
-```
+INPUT_DIM           = 784    # 28x28 pixels flattened
+H_DIM               = 400    # hidden layer width
+Z_DIM               = 20     # latent dimension
+BATCH_SIZE          = 128
+NUM_EPOCHS          = 120
+LR                  = 1e-3
+KL_ANNEAL_EPOCHS    = 10     # ramp beta from 0->1 over first 10 epochs
+EARLY_STOP_PATIENCE = 10
 
-### CVAE (`part2_cvae.py`, lines 142–161) — conditioning on label
-
+train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True,
+                          num_workers=2, pin_memory=True)
 ```
-Input: x (784) || one_hot(y) (10)  = 794 dimensions
-  ↓ Linear(794 → 400) + ReLU
-  ↓ → μ (20),  log_var (20)
-  ↓ Reparameterize
-  ↓ z (20) || one_hot(y) (10) = 30 dimensions → decoder
-  ↓ Linear(30 → 400) + ReLU
-  ↓ Linear(400 → 784)
-```
-
-**Code — CVAE `__init__`** (`part2_cvae.py`, lines 154–161)
-```python
-# Encoder takes x + label
-self.enc_hidden  = nn.Linear(input_dim + num_classes, h_dim)  # 784+10=794 → 400
-# Decoder takes z + label
-self.dec_hidden  = nn.Linear(z_dim + num_classes, h_dim)      # 20+10=30 → 400
-```
+`pin_memory=True` pre-pins host memory for faster CPU->GPU transfer. `shuffle=True` randomises batch order each epoch.
 
 ---
 
-## 3.3 Encode Step
+### Step 2 — VAE Architecture
 
-### Theory
-The encoder maps input `x` to distribution parameters `(μ, log_var)` representing `q_φ(z|x)`.
+The encoder has **two output heads** (mu and log_var) sharing a single hidden layer.
 
-Using `log_var` (instead of variance or std) is a **numerical stability** choice: it can take any real value (no clamping needed) and `σ = exp(0.5·log_var)` is always positive.
+**Code — `VAE.__init__`** (`part1_vae.py`, lines 127-134):
+```python
+# Encoder: two separate linear heads after shared hidden
+self.enc_hidden  = nn.Linear(input_dim, h_dim)   # 784 -> 400
+self.enc_mu      = nn.Linear(h_dim, z_dim)        # 400 -> 20  (mu)
+self.enc_log_var = nn.Linear(h_dim, z_dim)        # 400 -> 20  (log sigma^2)
 
-### Code — VAE `encode` (`part1_vae.py`, lines 136–149)
+# Decoder: single path back to pixel space
+self.dec_hidden  = nn.Linear(z_dim, h_dim)        # 20  -> 400
+self.dec_out     = nn.Linear(h_dim, input_dim)    # 400 -> 784 (raw logits)
+```
+
+`log_var` is used instead of `var` because it can take any real value — no positivity constraint needed. Variance is recovered by `sigma^2 = exp(log_var)`, which is always positive.
+
+---
+
+### Step 3a — Encode: x -> (mu, log_var)
+
+Maps a flattened image to the parameters of the approximate posterior `q_phi(z|x) = N(z | mu, diag(sigma^2))`.
+
+**Code — `VAE.encode`** (`part1_vae.py`, lines 136-149):
 ```python
 def encode(self, x):
-    h       = self.relu(self.enc_hidden(x))  # shared hidden representation
-    mu      = self.enc_mu(h)                 # mean of q(z|x)
-    log_var = self.enc_log_var(h)            # log variance of q(z|x)
-    return mu, log_var
-```
-
-### Code — CVAE `encode` (`part2_cvae.py`, lines 163–179)
-```python
-def encode(self, x, y_onehot):
-    inp = torch.cat([x, y_onehot], dim=1)   # (B, 794) — label concatenated
-    h       = self.relu(self.enc_hidden(inp))
-    mu      = self.enc_mu(h)
-    log_var = self.enc_log_var(h)
+    h       = self.relu(self.enc_hidden(x))   # shared hidden representation
+    mu      = self.enc_mu(h)                  # mean of q(z|x)
+    log_var = self.enc_log_var(h)             # log variance of q(z|x)
     return mu, log_var
 ```
 
 ---
 
-## 3.4 Reparameterization Trick
+### Step 3b — Reparameterization Trick: (mu, log_var) -> z
 
-### Theory
-We need to sample `z ~ q_φ(z|x) = N(μ, σ²)` and **backpropagate gradients through the sample**. Direct sampling is non-differentiable. The reparameterization trick rewrites:
+**Problem**: Sampling `z ~ N(mu, sigma^2)` is stochastic — gradients cannot flow through it.  
+**Solution**: Rewrite as a deterministic function of parameters plus fixed noise:
 
 ```
-z = μ + σ · ε,     ε ~ N(0, I)
+z = mu + sigma * eps,     eps ~ N(0, I)
 ```
 
-Now `z` is a deterministic function of `μ`, `σ`, and the **fixed noise** `ε`. Gradients flow through `μ` and `σ`.
+Gradients now flow through `mu` and `sigma` normally.
 
-### Code (`part1_vae.py`, lines 151–164; identical in CVAE)
+**Code** (`part1_vae.py`, lines 151-164):
 ```python
 @staticmethod
-def reparameterize(mu: torch.Tensor, log_var: torch.Tensor) -> torch.Tensor:
-    std     = torch.exp(0.5 * log_var)    # σ = exp(log_var / 2)
-    epsilon = torch.randn_like(std)       # ε ~ N(0, I), same shape as std
-    return mu + std * epsilon             # z = μ + σ·ε  (differentiable w.r.t. μ, σ)
+def reparameterize(mu, log_var):
+    std     = torch.exp(0.5 * log_var)    # sigma = exp(log_var / 2)
+    epsilon = torch.randn_like(std)       # eps ~ N(0,I), detached from graph
+    return mu + std * epsilon             # z = mu + sigma*eps  (differentiable)
 ```
-`torch.randn_like` creates `ε` on the same device/dtype as `std` without any graph connection, so gradients propagate only through `mu` and `std`.
+`torch.randn_like(std)` creates eps with the same shape/device but no gradient connection.
 
 ---
 
-## 3.5 Decode Step
+### Step 3c — Decode: z -> x_hat_logits
 
-### Theory
-The decoder takes `z` (and optionally the label for CVAE) and maps it back to reconstruction logits. The sigmoid is applied **outside** the model (not in `decode`) for two reasons:
-1. `BCEWithLogitsLoss` is numerically more stable than `BCELoss(sigmoid(logits))`.
-2. During sampling/generation we can still apply sigmoid explicitly.
+Maps the latent vector back to pixel space, outputting **raw logits** (before sigmoid).
 
-### Code — VAE `decode` (`part1_vae.py`, lines 166–176)
+**Code — `VAE.decode`** (`part1_vae.py`, lines 166-176):
 ```python
 def decode(self, z):
     h = self.relu(self.dec_hidden(z))
-    return self.dec_out(h)               # returns raw logits (pre-sigmoid)
+    return self.dec_out(h)       # raw logits (pre-sigmoid), shape (B, 784)
 ```
+Sigmoid is applied explicitly only during inference/generation (not during training — the fused loss handles it).
 
-### Code — CVAE `decode` (`part2_cvae.py`, lines 196–209)
+---
+
+### Step 3d — Full Forward Pass
+
+**Code — `VAE.forward`** (`part1_vae.py`, lines 178-192):
 ```python
-def decode(self, z, y_onehot):
-    inp = torch.cat([z, y_onehot], dim=1)   # (B, 30) — z || label
-    h   = self.relu(self.dec_hidden(inp))
-    return self.dec_out(h)
+def forward(self, x):
+    mu, log_var     = self.encode(x)                    # Step 3a
+    z               = self.reparameterize(mu, log_var)  # Step 3b
+    x_hat_logits    = self.decode(z)                    # Step 3c
+    return x_hat_logits, mu, log_var
 ```
 
 ---
 
-## 3.6 ELBO Loss Function
+### Step 4 — Compute ELBO Loss
 
-### Theory
-The VAE objective is the **Evidence Lower BOund (ELBO)**:
-
-```
-ELBO = E_{q(z|x)}[log p(x|z)]  −  KL(q(z|x) || p(z))
-     = Reconstruction term      −  Regularisation term
-```
-
-We **maximise** ELBO (equivalently, **minimise** negative ELBO = Loss).
-
-**Reconstruction term**: Binary Cross-Entropy between `x` and `sigmoid(x̂_logits)`:
+The VAE maximises the **Evidence Lower BOund (ELBO)**:
 
 ```
-Recon = −Σ_i [x_i log σ(x̂_i) + (1−x_i) log(1−σ(x̂_i))]
+ELBO = E_{q(z|x)}[log p(x|z)]  -  KL(q(z|x) || p(z))
+     = Reconstruction term       -  Regularisation term
 ```
 
-**KL divergence** (closed form for Gaussian vs. standard Gaussian):
-
+**Reconstruction loss**: Binary cross-entropy via fused `BCEWithLogitsLoss` (numerically stable and AMP-safe).  
+**KL divergence** (closed-form for two Gaussians):
 ```
-KL = −½ Σ_j (1 + log σ²_j − μ²_j − σ²_j)
-   = −½ Σ_j (1 + log_var_j − mu_j² − exp(log_var_j))
+KL = -0.5 * sum_j (1 + log_var_j - mu_j^2 - exp(log_var_j))
 ```
 
-### Code — `vae_loss` (`part1_vae.py`, lines 202–224)
+**Code** (`part1_vae.py`, lines 199-224):
 ```python
 bce_logits_loss_fn = nn.BCEWithLogitsLoss(reduction="sum")
 
 def vae_loss(x, x_hat_logits, mu, log_var, beta=1.0):
     batch_size = x.size(0)
 
-    # Reconstruction: fused sigmoid + BCE (numerically stable under AMP)
-    recon = bce_logits_loss_fn(x_hat_logits, x) / batch_size
+    recon = bce_logits_loss_fn(x_hat_logits, x) / batch_size   # Reconstruction
 
-    # KL: closed-form for N(μ,σ²) vs N(0,I)
-    kl = -0.5 * torch.sum(1 + log_var - mu.pow(2) - log_var.exp()) / batch_size
+    kl    = -0.5 * torch.sum(1 + log_var - mu.pow(2) - log_var.exp()) / batch_size  # KL
 
-    total = recon + beta * kl    # β controls KL weight (annealing)
+    total = recon + beta * kl   # beta controls KL weight
     return total, recon, kl
 ```
-Identical formula in CVAE (`cvae_loss`, `part2_cvae.py` lines 237–259).
 
 ---
 
-## 3.7 KL Annealing (β-VAE Schedule)
+### Step 5 — Training Loop: KL Annealing + AMP + Early Stopping
 
-### Theory
-**Posterior collapse**: early in training, the decoder is too weak to use `z`, so the encoder collapses to the prior (`μ ≈ 0`, `σ ≈ 1`) and the KL term vanishes. To prevent this, the KL weight `β` is linearly ramped from 0 to 1 over the first `KL_ANNEAL_EPOCHS` epochs.
+#### KL Annealing (beta-VAE Schedule)
 
-During warm-up (`β ≈ 0`), the model is essentially a standard autoencoder — it learns to encode information. Once `β = 1`, the full VAE objective is applied.
+**Posterior collapse**: early in training, if KL is large, the encoder collapses to the prior (mu->0, sigma->1) and the decoder ignores z entirely. Solution: start with `beta = 0` (pure reconstruction) and linearly increase to `beta = 1`.
 
-### Code (`part1_vae.py`, lines 249–251 in training loop)
+**Code** (`part1_vae.py`, lines 249-251):
 ```python
-# KL annealing: linearly ramp β from 0 → 1 over first KL_ANNEAL_EPOCHS
-beta = min(1.0, epoch / KL_ANNEAL_EPOCHS)   # epoch=1: β=0.1, ..., epoch=10: β=1.0
+beta = min(1.0, epoch / KL_ANNEAL_EPOCHS)
+# epoch=1 -> beta=0.1,  epoch=10+ -> beta=1.0
 ```
-`KL_ANNEAL_EPOCHS = 10` (`part1_vae.py` line 61), so full ELBO is active from epoch 10 onward.
 
----
+#### Mixed-Precision (AMP) Training
 
-## 3.8 Training Loop with Mixed-Precision (AMP)
+`torch.amp.autocast` runs the forward pass in float16. The `GradScaler` prevents float16 underflow in gradients.
 
-### Theory
-NVIDIA's Automatic Mixed Precision (AMP) uses `float16` where safe (large matrix ops) and `float32` where needed (accumulated sums, loss). A `GradScaler` scales the loss before `.backward()` to prevent underflow in `float16` gradients.
-
-### Code (`part1_vae.py`, lines 255–283)
+**Code** (`part1_vae.py`, lines 260-268):
 ```python
-for epoch in range(1, NUM_EPOCHS + 1):
-    beta = min(1.0, epoch / KL_ANNEAL_EPOCHS)   # KL annealing
+with torch.amp.autocast("cuda", dtype=torch.float16):
+    x_hat, mu, log_var = model(x)
+    loss, recon, kl    = vae_loss(x, x_hat, mu, log_var, beta)
 
-    for i, (x, _) in enumerate(loop):
-        x = x.view(-1, INPUT_DIM).to(device, non_blocking=True)
-
-        # AMP forward pass in float16
-        with torch.amp.autocast("cuda", dtype=torch.float16):
-            x_hat, mu, log_var = model(x)
-            loss, recon, kl    = vae_loss(x, x_hat, mu, log_var, beta)
-
-        optimizer.zero_grad(set_to_none=True)  # slightly faster than zero_grad()
-        scaler.scale(loss).backward()          # scale loss for float16 stability
-        scaler.step(optimizer)                 # unscale, check for inf/nan, then step
-        scaler.update()                        # update scaler factor
+optimizer.zero_grad(set_to_none=True)
+scaler.scale(loss).backward()   # scale loss -> prevent float16 underflow
+scaler.step(optimizer)          # unscale gradients -> check inf/NaN -> step
+scaler.update()                 # update scaler factor
 ```
-For CVAE, the same structure is used but `model(x, y_onehot)` passes the label (`part2_cvae.py` line 298).
 
----
+#### Early Stopping
 
-## 3.9 Early Stopping
+Begins **after** the KL annealing phase (during annealing beta changes, making cross-epoch loss comparison invalid).
 
-### Theory
-After the KL annealing phase, the best model is tracked and training stops if no improvement for `EARLY_STOP_PATIENCE` consecutive epochs.
-
-### Code (`part1_vae.py`, lines 306–322)
+**Code** (`part1_vae.py`, lines 306-322):
 ```python
-if epoch > KL_ANNEAL_EPOCHS:                 # only after β=1
+if epoch > KL_ANNEAL_EPOCHS:
     if avg_total < best_loss:
-        best_loss       = avg_total
+        best_loss        = avg_total
         patience_counter = 0
-        torch.save(model.state_dict(), ...best_model.pt...)
+        torch.save(model.state_dict(), best_model_path)
     else:
         patience_counter += 1
         if patience_counter >= EARLY_STOP_PATIENCE:
-            print(f"[EARLY STOP] ...")
             break
 else:
-    # During annealing: always update best model (β changing so loss not comparable)
-    best_loss = avg_total
-    torch.save(model.state_dict(), ...best_model.pt...)
+    best_loss = avg_total              # during annealing: always save
+    torch.save(model.state_dict(), best_model_path)
 ```
 
 ---
 
-## 3.10 Generation (Sampling from Prior)
+### Step 6 — Generation: Sample from Prior
 
-### Theory
-After training, to generate new images: sample `z ~ N(0, I)`, then decode to get `x̂`.
-
-### Code — VAE Sampling (`part1_vae.py`, lines 402–405)
+**Code** (`part1_vae.py`, lines 402-405):
 ```python
-z       = torch.randn(64, Z_DIM, device=device)          # sample from prior
-samples = torch.sigmoid(model.decode(z)).view(-1, 1, 28, 28)  # decode + sigmoid
+z       = torch.randn(64, Z_DIM, device=device)          # 64 samples from N(0,I)
+samples = torch.sigmoid(model.decode(z)).view(-1, 1, 28, 28).cpu()
+# sigmoid converts raw logits to pixel probabilities in (0,1)
 ```
 
-### Code — CVAE Conditional Generation (`part2_cvae.py`, lines 442–449)
+### Step 7 — Latent Space Visualisation
+
+**PCA of latent means** (`part1_vae.py`, lines 419-458): encode all 10 000 test images, project their mu vectors to 2D via PCA, colour by digit label.
+
+**Latent interpolation** (`part1_vae.py`, lines 462-515):
 ```python
-for digit in range(NUM_CLASSES):
-    z      = torch.randn(num_samples_per_digit, Z_DIM, device=device)
-    labels = torch.full((num_samples_per_digit,), digit, ...)
-    y_onehot = one_hot(labels, device=device)
-    samples  = torch.sigmoid(model.decode(z, y_onehot)).view(-1, 1, 28, 28)
-```
-By fixing the label `y` while sampling `z ~ N(0,I)`, the CVAE generates images of a specific digit on demand.
-
----
-
-## 3.11 Latent Interpolation
-
-### Theory
-Linearly interpolate between two latent codes `μ_a` and `μ_b`:
-```
-z_α = (1 − α)·μ_a + α·μ_b,   α ∈ [0, 1]
-```
-Decoding each `z_α` gives a morphing sequence between two images.
-
-### Code — VAE Interpolation (`part1_vae.py`, lines 490–499)
-```python
-with torch.no_grad():
-    mu_a, _ = model.encode(img_a)
-    mu_b, _ = model.encode(img_b)
+mu_a, _ = model.encode(img_a)
+mu_b, _ = model.encode(img_b)
 
 for alpha in np.linspace(0, 1, num_steps):
-    z_interp = (1 - alpha) * mu_a + alpha * mu_b
-    decoded  = torch.sigmoid(model.decode(z_interp)).view(1, 1, 28, 28)
+    z_interp = (1 - alpha) * mu_a + alpha * mu_b     # straight line in latent space Z
+    decoded  = torch.sigmoid(model.decode(z_interp))
 ```
-
-### Code — CVAE Interpolation (`part2_cvae.py`, lines 503–513)
-```python
-for step, alpha in enumerate(np.linspace(0, 1, num_steps)):
-    z_interp = (1 - alpha) * mu_1 + alpha * mu_7
-    y_interp = (1 - alpha) * y_oh_1 + alpha * y_oh_7  # also interpolate the label!
-    decoded  = torch.sigmoid(model.decode(z_interp, y_interp))
-```
-The CVAE additionally interpolates the **one-hot label vector**, creating a smooth transition in both latent and class-conditioning spaces.
+Smooth morphing demonstrates the continuity of the learned latent space.
 
 ---
 
-## 3.12 One-Hot Encoding Helper
+## Part 2 — CVAE Pipeline
 
-**Code** (`part2_cvae.py`, lines 111–125)
+The CVAE extends the VAE by conditioning every step on a class label. The label is encoded as a **one-hot vector** of length 10 and concatenated to the encoder input and decoder input.
+
+---
+
+### One-Hot Encoding of Labels
+
+**Code** (`part2_cvae.py`, lines 111-125):
 ```python
-def one_hot(labels: torch.Tensor, num_classes: int = NUM_CLASSES,
-            device: str = "cuda") -> torch.Tensor:
-    """
-    Creates a (B, 10) tensor where position y is set to 1.
-    Uses scatter_ for efficiency — no Python loop over batch.
-    """
+def one_hot(labels, num_classes=NUM_CLASSES, device="cuda"):
     return torch.zeros(labels.size(0), num_classes, device=device).scatter_(
-        1, labels.unsqueeze(1), 1   # scatter 1 at (batch_idx, label_idx)
+        1, labels.unsqueeze(1), 1   # place 1 at position labels[i] in row i
     )
 ```
 
 ---
 
-## 3.13 VAE vs CVAE — Key Differences
+### Conditional Architecture — Key Structural Change
+
+| Component | VAE input | CVAE input | Size difference |
+|---|---|---|---|
+| `enc_hidden` | `x` (784) | `x concat one_hot(y)` (794) | +10 |
+| `dec_hidden` | `z` (20) | `z concat one_hot(y)` (30) | +10 |
+
+**Code — `CVAE.__init__`** (`part2_cvae.py`, lines 154-161):
+```python
+self.enc_hidden = nn.Linear(input_dim + num_classes, h_dim)  # 784+10=794 -> 400
+self.dec_hidden = nn.Linear(z_dim + num_classes, h_dim)      # 20+10=30 -> 400
+```
+
+**Code — `CVAE.encode`** (`part2_cvae.py`, lines 163-179):
+```python
+def encode(self, x, y_onehot):
+    inp = torch.cat([x, y_onehot], dim=1)   # (B, 794)
+    h   = self.relu(self.enc_hidden(inp))
+    return self.enc_mu(h), self.enc_log_var(h)
+```
+
+**Code — `CVAE.decode`** (`part2_cvae.py`, lines 196-209):
+```python
+def decode(self, z, y_onehot):
+    inp = torch.cat([z, y_onehot], dim=1)   # (B, 30)
+    h   = self.relu(self.dec_hidden(inp))
+    return self.dec_out(h)
+```
+
+**Code — `CVAE.forward`** (`part2_cvae.py`, lines 211-227):
+```python
+def forward(self, x, y_onehot):
+    mu, log_var  = self.encode(x, y_onehot)
+    z            = self.reparameterize(mu, log_var)
+    x_hat_logits = self.decode(z, y_onehot)
+    return x_hat_logits, mu, log_var
+```
+
+---
+
+### CVAE Training Loop — Label Passed at Every Step
+
+**Code** (`part2_cvae.py`, lines 291-299):
+```python
+for i, (x, y) in enumerate(loop):
+    x        = x.view(-1, INPUT_DIM).to(device, non_blocking=True)
+    y_onehot = one_hot(y.to(device), device=device)
+
+    with torch.amp.autocast("cuda", dtype=torch.float16):
+        x_hat, mu, log_var = model(x, y_onehot)   # label passed at every step
+        loss, recon, kl    = cvae_loss(x, x_hat, mu, log_var, beta)
+```
+The ELBO loss formula is identical to the VAE — conditioning does not change the loss form.
+
+---
+
+### Conditional Generation — Specific Digit on Demand
+
+**Code** (`part2_cvae.py`, lines 442-449):
+```python
+for digit in range(NUM_CLASSES):         # digit = 0,1,...,9
+    z        = torch.randn(8, Z_DIM, device=device)
+    labels   = torch.full((8,), digit, dtype=torch.long, device=device)
+    y_onehot = one_hot(labels, device=device)
+    samples  = torch.sigmoid(model.decode(z, y_onehot)).view(-1, 1, 28, 28)
+```
+Keeping `y` fixed and varying `z` gives diversity within a class. Varying `y` gives different digit shapes.
+
+---
+
+### CVAE Latent Interpolation — Interpolating the Label Too
+
+**Code** (`part2_cvae.py`, lines 509-513):
+```python
+for step, alpha in enumerate(np.linspace(0, 1, num_steps)):
+    z_interp = (1 - alpha) * mu_1 + alpha * mu_7    # interpolate latent code
+    y_interp = (1 - alpha) * y_oh_1 + alpha * y_oh_7  # interpolate class label
+    decoded  = torch.sigmoid(model.decode(z_interp, y_interp))
+```
+A soft one-hot produces an intermediate class conditioning — the decoder morphs between digit shapes.
+
+---
+
+## VAE vs CVAE — Side-by-Side Comparison
 
 | Aspect | VAE | CVAE |
 |---|---|---|
-| Encoder input | `x` (784) | `x ∥ one_hot(y)` (794) |
-| Decoder input | `z` (20) | `z ∥ one_hot(y)` (30) |
-| Generation | Uncontrolled — random digit | Controlled — specific digit |
-| Interpolation | Interpolate `z` only | Interpolate `z` **and** `y` |
-| `enc_hidden` size | `Linear(784, 400)` | `Linear(794, 400)` |
-| `dec_hidden` size | `Linear(20, 400)` | `Linear(30, 400)` |
+| What does it learn? | Any digit from noise | Specific digit from noise + label |
+| Encoder input | `x` (784) | `x concat one_hot(y)` (794) |
+| Decoder input | `z` (20) | `z concat one_hot(y)` (30) |
+| `enc_hidden` | `Linear(784, 400)` | `Linear(794, 400)` |
+| `dec_hidden` | `Linear(20, 400)` | `Linear(30, 400)` |
+| Generation | Uncontrolled | Controlled by label |
+| Interpolation | Interpolate `z` only | Interpolate `z` AND `y` |
 
 ---
 
-## 3.14 Likely Viva Questions
+## Viva Q&A — Assignment 3
 
-| Question | Short Answer | Where in Code |
+| Question | Concise Answer | Code location |
 |---|---|---|
-| Why is reparameterization needed? | Sampling breaks the gradient flow; re-parameterizing as `μ + σ·ε` makes the sample differentiable. | `part1_vae.py` lines 151–164 |
-| Why use `log_var` instead of `var`? | Log can be any real value; variance must be positive. Avoids clamping. | `part1_vae.py` line 148 |
-| What is the KL divergence formula? | `−½ Σ(1 + log_var − μ² − exp(log_var))`. | `part1_vae.py` line 222 |
-| What is posterior collapse? | Encoder collapses to prior — KL = 0, decoder ignores z. KL annealing prevents this. | `part1_vae.py` lines 249–251 |
-| Why `BCEWithLogitsLoss` and not `BCELoss`? | Fused sigmoid + log is numerically stable and AMP-safe. | `part1_vae.py` lines 198–221 |
-| How does CVAE differ from VAE structurally? | Label concatenated to both encoder input and decoder input. | `part2_cvae.py` lines 154–161 |
-| How is generation controlled in CVAE? | Sample `z ~ N(0,I)` and provide desired `y_onehot` to `decode(z, y_onehot)`. | `part2_cvae.py` lines 442–449 |
-| What does the KL term in ELBO do? | Regularises the latent space towards `N(0,I)`, ensuring a continuous, sampleable space. | `part1_vae.py` lines 222–223 |
-| Why is early stopping only applied after KL annealing? | During annealing β changes, so loss values are not comparable across epochs. | `part1_vae.py` lines 306–322 |
-| What does `GradScaler` do? | Scales loss before backprop to avoid float16 underflow; unscales before optimizer step. | `part1_vae.py` lines 266–268 |
+| What is the task? | Implement VAE (unsupervised generation) and CVAE (class-conditional generation) on MNIST | `part1_vae.py`, `part2_cvae.py` |
+| What is the ELBO? | Evidence Lower BOund = Reconstruction loss + KL divergence | `part1_vae.py` L199-224 |
+| Why reparameterize? | Sampling breaks gradient flow — mu + sigma*eps makes it differentiable | `part1_vae.py` L151-164 |
+| Why `log_var` not `var`? | log can be any real -> no positivity constraint; sigma^2 = exp(log_var) always positive | `part1_vae.py` L148 |
+| What is posterior collapse? | Encoder collapses to prior (KL->0), decoder ignores z — prevented by KL annealing | `part1_vae.py` L249-251 |
+| What does KL annealing do? | Ramps beta 0->1 — starts as autoencoder, gradually becomes full VAE | `part1_vae.py` L249-251 |
+| Why `BCEWithLogitsLoss`? | Fused sigmoid+log is numerically stable and safe under float16 AMP | `part1_vae.py` L199-221 |
+| What does GradScaler do? | Scales loss before backprop to prevent float16 underflow; unscales before optimizer step | `part1_vae.py` L266-268 |
+| Why early stopping only after annealing? | beta changes during annealing, making cross-epoch loss comparison invalid | `part1_vae.py` L306-322 |
+| How does CVAE differ structurally? | Label one-hot concatenated to encoder AND decoder input; those layers are 10 units wider | `part2_cvae.py` L154-161 |
+| How do you generate a specific digit with CVAE? | Sample z~N(0,I), set y_onehot to desired digit, call `decode(z, y_onehot)` | `part2_cvae.py` L442-449 |
+| What does interpolating the label do? | Soft one-hot creates intermediate class conditioning — decoder morphs between digits | `part2_cvae.py` L509-513 |
 
 ---
 
-# Quick Concept-to-File Index
+# Quick Concept-to-File Reference
 
 | Concept | File | Lines |
 |---|---|---|
-| GBT Regression initialisation (`F_0 = mean(y)`) | `Assignment1/src/gbt/core.py` | 127–129 |
-| GBT Classification initialisation (log-odds) | `Assignment1/src/gbt/core.py` | 273–279 |
-| MSE pseudo-residuals | `Assignment1/src/gbt/utils.py` | 25–32 |
-| Logistic pseudo-residuals | `Assignment1/src/gbt/utils.py` | 61–74 |
-| MSE leaf optimisation (mean) | `Assignment1/src/gbt/utils.py` | 35–43 |
-| Logistic leaf optimisation (Newton step) | `Assignment1/src/gbt/utils.py` | 77–109 |
-| Leaf-to-gamma map construction | `Assignment1/src/gbt/core.py` | 160–167 |
-| Model update with shrinkage | `Assignment1/src/gbt/core.py` | 169–172 |
-| Row subsampling | `Assignment1/src/gbt/core.py` | 79–86 |
-| Prediction accumulation | `Assignment1/src/gbt/core.py` | 199–222 |
-| Numerically stable Cholesky | `Assignment2/src/gp/base.py` | 39–54 |
-| Cholesky solve | `Assignment2/src/gp/base.py` | 57–79 |
-| Log marginal likelihood | `Assignment2/src/gp/base.py` | 82–124 |
-| RBF kernel | `Assignment2/src/gp/kernels.py` | 68–137 |
-| Matérn kernel | `Assignment2/src/gp/kernels.py` | 140–232 |
-| Rational Quadratic kernel | `Assignment2/src/gp/kernels.py` | 235–316 |
-| GP Regression fit (Alg. 2.1 steps 1–3) | `Assignment2/src/gp/regression.py` | 117–131 |
-| GP Regression predict (Alg. 2.1 steps 4–5) | `Assignment2/src/gp/regression.py` | 133–191 |
-| Hyperparameter optimisation (L-BFGS-B) | `Assignment2/src/gp/regression.py` | 236–302 |
-| GP Classification Newton loop (Alg. 3.1) | `Assignment2/src/gp/classification.py` | 121–171 |
-| GP Classification predictions (Alg. 3.2) | `Assignment2/src/gp/classification.py` | 180–231 |
-| Logistic gradient & Hessian | `Assignment2/src/gp/classification.py` | 296–339 |
-| VAE architecture | `Assignment3/part1_vae.py` | 109–192 |
-| CVAE architecture | `Assignment3/part2_cvae.py` | 131–228 |
-| Reparameterization trick | `Assignment3/part1_vae.py` | 151–164 |
-| ELBO loss (VAE) | `Assignment3/part1_vae.py` | 202–224 |
-| ELBO loss (CVAE) | `Assignment3/part2_cvae.py` | 237–259 |
-| KL annealing | `Assignment3/part1_vae.py` | 249–251 |
-| AMP training loop | `Assignment3/part1_vae.py` | 255–283 |
-| Early stopping | `Assignment3/part1_vae.py` | 306–322 |
-| Prior sampling (generation) | `Assignment3/part1_vae.py` | 402–405 |
-| Conditional generation (CVAE) | `Assignment3/part2_cvae.py` | 442–449 |
-| Latent interpolation (VAE) | `Assignment3/part1_vae.py` | 490–499 |
-| Latent interpolation + label (CVAE) | `Assignment3/part2_cvae.py` | 503–513 |
+| **Assignment 1** | | |
+| GBT Regression init (F_0 = mean(y)) | `Assignment1/src/gbt/core.py` | 127-129 |
+| GBT Classification init (log-odds) | `Assignment1/src/gbt/core.py` | 273-279 |
+| MSE pseudo-residuals | `Assignment1/src/gbt/utils.py` | 25-32 |
+| Logistic pseudo-residuals | `Assignment1/src/gbt/utils.py` | 61-74 |
+| MSE leaf gamma (mean) | `Assignment1/src/gbt/utils.py` | 35-43 |
+| Logistic leaf gamma (Newton step) | `Assignment1/src/gbt/utils.py` | 77-109 |
+| Gamma map construction | `Assignment1/src/gbt/core.py` | 160-167 |
+| Model update with shrinkage | `Assignment1/src/gbt/core.py` | 169-176 |
+| Row subsampling | `Assignment1/src/gbt/core.py` | 79-86 |
+| Predict (accumulate trees) | `Assignment1/src/gbt/core.py` | 199-222 |
+| Sigmoid utility | `Assignment1/src/gbt/utils.py` | 112-118 |
+| **Assignment 2** | | |
+| Adaptive jitter Cholesky | `Assignment2/src/gp/base.py` | 39-54 |
+| Cholesky solve (K^{-1}*b) | `Assignment2/src/gp/base.py` | 57-79 |
+| Log marginal likelihood | `Assignment2/src/gp/base.py` | 82-124 |
+| RBF kernel | `Assignment2/src/gp/kernels.py` | 68-137 |
+| Matern kernel | `Assignment2/src/gp/kernels.py` | 140-232 |
+| Rational Quadratic kernel | `Assignment2/src/gp/kernels.py` | 235-316 |
+| Hyperparams in log space | `Assignment2/src/gp/kernels.py` | 111-118 |
+| Compute alpha | `Assignment2/src/gp/regression.py` | 117-131 |
+| GP predict (posterior mean+var) | `Assignment2/src/gp/regression.py` | 133-191 |
+| Hyperparameter optimisation | `Assignment2/src/gp/regression.py` | 236-302 |
+| Newton loop (Alg 3.1) | `Assignment2/src/gp/classification.py` | 121-162 |
+| Gradient + Hessian of log-lik | `Assignment2/src/gp/classification.py` | 296-339 |
+| Predictive probability (Alg 3.2) | `Assignment2/src/gp/classification.py` | 180-231 |
+| **Assignment 3** | | |
+| VAE architecture | `Assignment3/part1_vae.py` | 109-192 |
+| CVAE architecture | `Assignment3/part2_cvae.py` | 131-228 |
+| One-hot encoding (CVAE) | `Assignment3/part2_cvae.py` | 111-125 |
+| Encode step (VAE) | `Assignment3/part1_vae.py` | 136-149 |
+| Encode step (CVAE) | `Assignment3/part2_cvae.py` | 163-179 |
+| Reparameterization trick | `Assignment3/part1_vae.py` | 151-164 |
+| Decode step (VAE) | `Assignment3/part1_vae.py` | 166-176 |
+| Decode step (CVAE) | `Assignment3/part2_cvae.py` | 196-209 |
+| ELBO loss (VAE) | `Assignment3/part1_vae.py` | 199-224 |
+| ELBO loss (CVAE) | `Assignment3/part2_cvae.py` | 237-259 |
+| KL annealing | `Assignment3/part1_vae.py` | 249-251 |
+| AMP training step | `Assignment3/part1_vae.py` | 260-268 |
+| Early stopping | `Assignment3/part1_vae.py` | 306-322 |
+| Generation from prior (VAE) | `Assignment3/part1_vae.py` | 402-405 |
+| Conditional generation (CVAE) | `Assignment3/part2_cvae.py` | 442-449 |
+| Latent interpolation (VAE) | `Assignment3/part1_vae.py` | 462-515 |
+| Latent interpolation + label (CVAE) | `Assignment3/part2_cvae.py` | 473-527 |
